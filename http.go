@@ -21,6 +21,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-log/log"
@@ -338,142 +339,253 @@ func (h *httpHandler) handleRequest(conn net.Conn, req *http.Request) {
 	defer cc.Close()
 
 	if req.Method != http.MethodConnect {
-		log.Logf("[handleProxy] %s <- %s,%s,%s\n%s", conn.RemoteAddr(), conn.LocalAddr(), req.URL.Scheme, req.Proto, req.URL)
-		err = h.handleProxy(conn, cc, req)
+		h.handleProxy(conn, cc, req)
+		return
 	} else {
-		//if req.Method == http.MethodConnect && strings.Contains(req.Proto, "https") || strings.Contains(req.URL.Scheme, "https")
-		log.Logf("[handleMITMConnect] %s <- %s,%s,%s\n%s", conn.RemoteAddr(), conn.LocalAddr(), req.URL.Scheme, req.Proto, req.URL)
-		err = h.handleMITMConnect(conn, req, clientIP, requestID)
-	}
-
-	//if err != nil {
-	//	log.Logf("[forwardRequest] %s <- %s,%s,%s\n%s", conn.RemoteAddr(), conn.LocalAddr(), req.URL.Scheme, req.Proto, req.URL)
-	//	if err = h.forwardRequest(conn, req, route); err == nil {
-	//		return
-	//	}
-	//}
-
-	if err == nil {
+		h.handleMITMConnect(conn, req, clientIP, requestID)
 		return
 	}
 
-	log.Logf("[other] %s <- %s,%s,%s\n%s", conn.RemoteAddr(), conn.LocalAddr(), req.URL.Scheme, req.Proto, req.URL)
-
-	b := []byte("HTTP/1.1 200 Connection established\r\n" +
-		"Proxy-Agent: " + proxyAgent + "\r\n\r\n")
-	if Debug {
-		log.Logf("[http] %s <- %s\n%s", conn.RemoteAddr(), conn.LocalAddr(), string(b))
-	}
-	conn.Write(b)
-
-	log.Logf("[http] %s <-> %s", conn.RemoteAddr(), host)
-	transport(conn, cc)
-	//transportWithHTTPLog(conn, cc, clientIP, requestID)
-	log.Logf("[http] %s >-< %s", conn.RemoteAddr(), host)
 }
 
-func transportWithHTTPLog(client, server net.Conn, clientIP, requestID string) {
+func interceptHTTP(client net.Conn, server net.Conn, clientIP, requestID string) {
+	clientReader := bufio.NewReader(client)
+	serverReader := bufio.NewReader(server)
 
-	// ========== 方向 1：client -> server（拦截请求）==========
-	reqReader := bufio.NewReader(client)
-	var reqBuf = &limitedBuffer{limit: MaxBodyLogBytes}
-	var respBuf = &limitedBuffer{limit: MaxBodyLogBytes}
+	var reqBuf, respBuf limitedBuffer
+	reqBuf.limit = 65535 * 2
+	respBuf.limit = 65535 * 2
 
-	// 尝试读取 HTTP 请求
-	req, err := http.ReadRequest(reqReader)
-	if err != nil {
-		// 不是 HTTP 请求？直接降级透明拷贝
-		io.Copy(server, io.MultiReader(bytes.NewReader(reqBuf.Bytes()), reqReader))
-		go io.Copy(client, server)
-		return
-	}
-
-	// 读取完整请求体
-	if req.Body != nil {
-		body, _ := io.ReadAll(io.TeeReader(req.Body, reqBuf))
-		req.Body.Close()
-		req.Body = io.NopCloser(bytes.NewReader(body)) // 恢复 Body 给下游使用
-	}
-
-	// 把请求写往 server
-	if err := req.Write(server); err != nil {
-		return
-	}
-
-	// ========== 方向 2：server -> client（拦截响应）==========
-	go func() {
-		respReader := bufio.NewReader(server)
-
-		for {
-			resp := &http.Response{}
-
-			// 读取 HTTP 响应
-			r, err := http.ReadResponse(respReader, req)
-			if err != nil {
-				// 不是合法 HTTP 响应，降级为直接拷贝剩余数据
-				//io.Copy(client, io.MultiReader(bytes.NewReader(respReader.), respReader))
-				transport(client, server)
-				return
-			}
-			resp = r
-
-			// 读取响应体
-			if resp.Body != nil {
-				body, _ := io.ReadAll(io.TeeReader(resp.Body, respBuf))
-				resp.Body.Close()
-				resp.Body = io.NopCloser(bytes.NewReader(body)) // 恢复 Body
-			}
-
-			// ====== 调用你的日志记录函数 ======
-			logMITMTraffic(
-				requestID,
-				clientIP,
-				"HTTP-PLAIN",
-				req,
-				resp,
-				reqBuf,
-				respBuf,
-			)
-
-			// 写回客户端
-			if err := resp.Write(client); err != nil {
-				return
-			}
-
-			// 判断是否 keep-alive
-			if resp.Close || req.Close {
-				return
-			}
-
-			// 尝试读取下一次请求（HTTP pipeline 或 keep-alive）
-			req, err = http.ReadRequest(reqReader)
-			if err != nil {
-				return
-			}
-			// 读取请求体
-			if req.Body != nil {
-				body, _ := io.ReadAll(io.TeeReader(req.Body, reqBuf))
-				req.Body.Close()
-				req.Body = io.NopCloser(bytes.NewReader(body))
-			}
-			req.Write(server)
+	for {
+		// ---- 读取客户端 HTTP 请求 ----
+		req, err := http.ReadRequest(clientReader)
+		if err != nil {
+			// 读取客户端请求失败（包括 EOF），结束拦截
+			return
 		}
+		// 代理到 origin server 时必须清空 RequestURI
+		req.RequestURI = ""
+
+		// 捕获并缓存请求体（如果有）
+		if req.Body != nil {
+			// 将请求体读到 reqBuf，并把 Body 替换为新的 reader 以便后续写给 server
+			io.Copy(&reqBuf, req.Body)
+			req.Body.Close()
+			req.Body = io.NopCloser(bytes.NewReader(reqBuf.Bytes()))
+
+		}
+
+		// ---- 发送请求到目标服务器 ----
+		// 删除代理相关头，确保写给 server 的头合规（可根据需要保留 Host）
+		req.Header.Del("Proxy-Connection")
+		if err = req.Write(server); err != nil {
+			return
+		}
+
+		// ---- 读取目标服务器返回 ----
+		resp, err := http.ReadResponse(serverReader, req)
+		if err != nil {
+			return
+		}
+
+		// ---- 关键：不要预先把 body 全部读取到内存然后再消费 ----
+		// 使用 TeeReader：当我们把响应写回客户端时，读取 resp.Body 会同时把数据写到 respBuf
+		if resp.Body != nil {
+			resp.Body = io.NopCloser(io.TeeReader(resp.Body, &respBuf))
+		}
+
+		// ---- 把响应转发回客户端（resp.Write 会读取 resp.Body 并触发 TeeReader） ----
+		if err = resp.Write(client); err != nil {
+			// 确保关闭响应体
+			if resp.Body != nil {
+				io.Copy(io.Discard, resp.Body) // drain if needed
+				resp.Body.Close()
+			}
+			return
+		}
+
+		// resp.Write 已读取并发送了 body（TeeReader 已把数据写入 respBuf）
+		// 现在我们可以异步记录日志（respBuf 包含已读响应体）
+		if EnableTrafficLog {
+			// 如果 resp.Body 尚未关闭，关闭它
+			if resp.Body != nil {
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+			}
+			// 复制一份 req 和 resp 头/内容去记录（避免竞争）
+			go func(r *http.Request, rp *http.Response, reqB, respB []byte) {
+				// 注意：logMITMTraffic 的入参需要 req 和 resp 原对象；我们在这里复用已有的 req/rp
+				// 如果 logMITMTraffic 需要完整的 body bytes，它会从 reqB/respB 中获取
+				// 为最少改动，调用原函数但手动填充缓冲区变量
+				// Reconstruct bodies for logging:
+				// req.Body is already consumed; use reqB; resp.Body consumed, respB has content.
+				// So we create new Request/Response copies or modify fields appropriately.
+				// For simplicity, call a thin wrapper to avoid changing logMITMTraffic signature:
+				reqCopy := r.Clone(context.Background())
+				if len(reqB) > 0 {
+					reqCopy.Body = io.NopCloser(bytes.NewReader(reqB))
+				} else {
+					reqCopy.Body = nil
+				}
+
+				respCopy := &http.Response{
+					StatusCode: rp.StatusCode,
+					ProtoMajor: rp.ProtoMajor,
+					ProtoMinor: rp.ProtoMinor,
+					Header:     rp.Header.Clone(),
+					Body:       io.NopCloser(bytes.NewReader(respB)),
+				}
+
+				// Note: originReq header proxy_extra_info may be empty here; you can pass "" or adapt as needed.
+				logMITMTraffic(requestID, clientIP, req.Header.Get("proxy_extra_info"), "http", reqCopy, respCopy, &limitedBuffer{buf: *bytes.NewBuffer(reqB), limit: len(reqB)}, &limitedBuffer{buf: *bytes.NewBuffer(respB), limit: len(respB)})
+			}(req, resp, reqBuf.Bytes(), respBuf.Bytes())
+		} else {
+			// 如果没有启用日志，确保关闭 body
+			if resp.Body != nil {
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+			}
+		}
+	}
+}
+
+func (h *httpHandler) handleProxy(rw, cc io.ReadWriter, req *http.Request) (err error) {
+	req.Header.Del("Proxy-Connection")
+
+	if err = req.Write(cc); err != nil {
+		return err
+	}
+
+	ch := make(chan error, 1)
+
+	go func() {
+		ch <- copyBuffer(rw, cc)
 	}()
 
-	// 主 goroutine 阻塞，与 server->client goroutine 协同退出
-	io.Copy(io.Discard, client)
+	for {
+		err := func() error {
+			req, err := http.ReadRequest(bufio.NewReader(rw))
+			if err != nil {
+				return err
+			}
+
+			if Debug {
+				dump, _ := httputil.DumpRequest(req, false)
+				log.Log(string(dump))
+			}
+
+			req.Header.Del("Proxy-Connection")
+
+			if err = req.Write(cc); err != nil {
+				return err
+			}
+			return nil
+		}()
+		ch <- err
+
+		if err != nil {
+			break
+		}
+	}
+
+	return <-ch
 }
 
 // handleMITMConnect 处理MITM模式下的CONNECT请求
+// bufferedConn 与之前一致，用于把 peek 的 bytes 放回到读取流中
+type bufferedConn struct {
+	net.Conn
+	buf *bytes.Reader
+}
+
+func newBufferedConn(c net.Conn, pre []byte) net.Conn {
+	var r *bytes.Reader
+	if len(pre) > 0 {
+		r = bytes.NewReader(pre)
+	} else {
+		r = bytes.NewReader(nil)
+	}
+	return &bufferedConn{Conn: c, buf: r}
+}
+
+func (b *bufferedConn) Read(p []byte) (int, error) {
+	if b.buf != nil && b.buf.Len() > 0 {
+		return b.buf.Read(p)
+	}
+	return b.Conn.Read(p)
+}
+
+// closeWriteIfPossible 尝试对 TCP 连接做半关闭（CloseWrite），若不可用则关闭整个连接
+func closeWriteIfPossible(c net.Conn) {
+	// net.Conn may implement interface with CloseWrite (e.g. *net.TCPConn)
+	type closeWriter interface {
+		CloseWrite() error
+	}
+	if cw, ok := c.(closeWriter); ok {
+		_ = cw.CloseWrite()
+		return
+	}
+	// For other types (e.g. tls.Conn) fallback to Close()
+	_ = c.Close()
+}
+
+// tunnel 阻塞直到双向复制完成，再返回。
+// 使用 CloseWrite 半关闭来通知另一端 EOF，从而优雅结束。
+func tunnel(client net.Conn, targetAddr string) error {
+	server, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
+	if err != nil {
+		return err
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// 从 client -> server
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(server, client)
+		// 关写端通知 server 已无更多数据
+		closeWriteIfPossible(server)
+	}()
+
+	// 从 server -> client
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(client, server)
+		// 关写端通知 client 已无更多数据
+		closeWriteIfPossible(client)
+	}()
+
+	// 等待两个方向都结束
+	wg.Wait()
+
+	// 关闭 server socket（client 在外层会被 defer 关闭）
+	_ = server.Close()
+	return nil
+}
+
+// 检测首包是否为 TLS ClientHello（简单但实用）
+func isTLSClientHello(b []byte) bool {
+	// TLS record header: type(1)=0x16, version(2)=0x03,0x01/02/03...
+	// also accept SSLv2 ClientHello legacy (starts with 0x80 ..) - optional
+	if len(b) >= 3 && b[0] == 0x16 && b[1] == 0x03 {
+		return true
+	}
+	// some SSLv2 style ClientHello begin with 0x80 or 0x00 with len; not needed in most cases
+	return false
+}
+
+// ---- 替换 handleMITMConnect ----
 func (h *httpHandler) handleMITMConnect(conn net.Conn, req *http.Request, clientIP, requestID string) error {
 	host := req.Host
+	// 如果没有端口，保守地假定 443（但我们会动态检测客户端是否为 TLS）
 	if _, port, _ := net.SplitHostPort(host); port == "" {
 		host = net.JoinHostPort(host, "443")
 	}
 
-	log.Logf("[http] [MITM] %s -> %s : upgrading CONNECT to plaintext proxy", clientIP, host)
+	log.Logf("[http] [MITM] %s -> %s : received CONNECT, will probe client to decide MITM or tunnel", clientIP, host)
 
-	// 1. 返回200连接建立（但不进入隧道模式）
+	// 1. 返回 200 Connection established（客户端预期）
 	proxyAgent := h.getProxyAgent()
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
@@ -489,36 +601,91 @@ func (h *httpHandler) handleMITMConnect(conn net.Conn, req *http.Request, client
 		return err
 	}
 
-	// 2. 劫持客户端连接，将其转换为TLS服务器（使用MITM证书）
-	tlsConfig, err := h.getMITMTLSConfig(host) // 动态生成目标网站的证书
+	// 2. 从客户端连接上 peek 一些字节，检测是 TLS 还是明文 HTTP
+	peekBuf := make([]byte, 5)
+	// 设置短超时防止 hang（几秒）
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, err := conn.Read(peekBuf)
+	// 清除 deadline
+	conn.SetReadDeadline(time.Time{})
+	if err != nil && err != io.EOF {
+		// 若客户端很快关闭连接或读出错，直接返回
+		if Debug {
+			log.Logf("[http] [MITM] %s -> %s : peek read err: %v", clientIP, host, err)
+		}
+		return err
+	}
+	peek := peekBuf[:n]
+
+	// 如果 peek 出现的是明文 HTTP 请求（例如 'G' 'E' 'T' 等 ASCII）或其它非 TLS 数据，
+	// 则我们应当建立原始隧道（不要做 MITM）。
+	if n > 0 && !isTLSClientHello(peek) {
+		log.Logf("[http] [MITM] %s -> %s : detected non-TLS (likely plaintext HTTP) after CONNECT, perform raw tunnel or intercepted-http", clientIP, host)
+
+		// 包装后端连接
+		bc := newBufferedConn(conn, peek)
+
+		// 如果开启流量日志 -> 使用 HTTP 层解析并记录（使用你已有的 interceptHTTP）
+		if EnableTrafficLog {
+			server, err := net.DialTimeout("tcp", host, 10*time.Second)
+			if err != nil {
+				log.Logf("[http] [MITM] %s -> %s : dial target failed: %v", clientIP, host, err)
+				return err
+			}
+			// 不要在这里并发 goroutine，直接调用 interceptHTTP，会阻塞直到完成（与 tunnel 行为一致）
+			interceptHTTP(bc, server, clientIP, requestID)
+			// interceptHTTP 函数会在合适时关闭连接或返回（当前实现为直接 return，当读写结束会退出）
+			return nil
+		}
+
+		// 否则不开启日志 -> 快速高效的二进制隧道（阻塞直到完成）
+		return tunnel(bc, host)
+	}
+
+	// 否则看起来像 TLS ClientHello，则我们继续进行 MITM（生成证书然后 tls.Server）
+	log.Logf("[http] [MITM] %s -> %s : detected TLS ClientHello, proceed with MITM", clientIP, host)
+
+	// 为了不丢掉已 peek 的 ClientHello，使用 bufferedConn
+	clientConn := newBufferedConn(conn, peek)
+
+	// 生成 MITM cert 等（你原来的逻辑）
+	tlsConfig, err := h.getMITMTLSConfig(host)
 	if err != nil {
 		log.Logf("[http] [MITM getMITMTLSConfig] %s -> %s : TLS getMITMTLSConfig failed: %v", clientIP, host, err)
-
+		return err
 	}
-	tlsConn := tls.Server(conn, tlsConfig)
 
-	// 3. 在TLS层之上进行HTTP明文通信
-	if err = tlsConn.Handshake(); err != nil {
+	tlsServer := tls.Server(clientConn, tlsConfig)
+	if err := tlsServer.Handshake(); err != nil {
 		log.Logf("[http] [MITM] %s -> %s : TLS handshake failed: %v", clientIP, host, err)
 		return err
 	}
 
-	// 4. 读取解密后的HTTP请求
-	decryptedReq, err := http.ReadRequest(bufio.NewReader(tlsConn))
-	if err != nil {
-		log.Logf("[http] [MITM] %s -> %s : failed to read decrypted request: %v", clientIP, host, err)
-		return err
-	}
-	defer decryptedReq.Body.Close()
+	// 读取解密后的 HTTP 请求（支持 keep-alive 循环）
+	decryptedReader := bufio.NewReader(tlsServer)
+	for {
+		decryptedReq, err := http.ReadRequest(decryptedReader)
+		if err != nil {
+			if Debug {
+				log.Logf("[http] [MITM] %s -> %s : read decrypted request error: %v", clientIP, host, err)
+			}
+			return err
+		}
 
-	// 5. 强制设置URL Scheme为https（重要！）
-	if !decryptedReq.URL.IsAbs() {
-		decryptedReq.URL.Scheme = "https"
-		decryptedReq.URL.Host = req.Host // 保留原始Host
-	}
+		// 保证 Host 字段正确（使用原始 CONNECT 的 host）
+		decryptedReq.Host = req.Host
+		decryptedReq.RequestURI = ""
 
-	// 6. 进入明文代理处理流程
-	return h.handleProxyMITM(tlsConn, decryptedReq, req, host, requestID, clientIP)
+		// 交由 MITM 的 proxy 处理（你的 handleProxyMITM）
+		if err := h.handleProxyMITM(tlsServer, decryptedReq, req, host, requestID, clientIP); err != nil {
+			return err
+		}
+
+		// 若客户端不想 keep-alive，则结束
+		if connHdr := decryptedReq.Header.Get("Connection"); strings.EqualFold(connHdr, "close") {
+			return nil
+		}
+	}
 }
 
 func (h *httpHandler) getProxyAgent() string {
@@ -654,176 +821,117 @@ func (h *httpHandler) generateLeafCertificate(host string, caCert *x509.Certific
 	return cert, nil
 }
 
+// handleProxyMITM - 修复：清理代理头、确保写给 origin server 时使用相对请求行（非 absolute-form），设置 Host，
+// 并根据 scheme 决定是否对目标建立 TLS 客户端连接。
+// 注意：这里 req 是从 TLS 解密后得到的请求（来自客户端）， originReq 是最初的 CONNECT 请求（保留一些元信息）。
 func (h *httpHandler) handleProxyMITM(rw io.ReadWriter, req, originReq *http.Request, host, requestID, clientIP string) error {
 	var reqBuf, respBuf limitedBuffer
 	reqBuf.limit = MaxBodyLogBytes
 	respBuf.limit = MaxBodyLogBytes
 
-	// 提取域名和端口
+	// 解析目标主机名和端口（host 可能包含端口）
 	hostname, port, err := net.SplitHostPort(host)
 	if err != nil {
-		// 没有端口，根据Scheme判断
 		hostname = host
-		if req.URL.Scheme == "https" {
-			port = "443"
-		} else {
-			port = "80"
-		}
+		// CONNECT 一般对应 https
+		port = "443"
 		host = net.JoinHostPort(hostname, port)
 	}
 
-	// 构建目标地址
 	targetAddr := host
 
-	// === 关键修复：判断是否为HTTPS端口，自动启用TLS ===
-	var cc net.Conn
-	if req.URL.Scheme == "https" {
-		log.Logf("[MITM] %s -> %s : establishing TLS connection to target", clientIP, targetAddr)
+	// ---- 清理并准备请求，将其转换为发给 origin server 的形式 ----
+	// 删除代理特有头
+	req.Header.Del("Proxy-Connection")
+	req.Header.Del("Proxy-Authenticate")
+	req.Header.Del("Proxy-Authorization")
+	// 如果客户端带有 Connection: keep-alive/close，保留其语义，但不应带 Proxy-Connection
+	// 设置请求 Host 字段（重要）
+	req.Host = originReq.Host // 保留原始 CONNECT 的 host (带端口)
+	// Ensure RequestURI empty so http.Request.Write will write path-form (not absolute-form)
+	req.RequestURI = ""
 
-		// 创建TLS配置（作为客户端连接目标服务器）
-		tlsConfig := &tls.Config{
-			ServerName: hostname, // SNI，必须设置
-			MinVersion: tls.VersionTLS12,
-		}
-
-		// 建立TLS连接
-		cc, err = tls.Dial("tcp", targetAddr, tlsConfig)
-		if err != nil {
-			log.Logf("[MITM] Failed to establish TLS connection to %s: %v", targetAddr, err)
-			return fmt.Errorf("tls dial failed: %w", err)
-		}
-		log.Logf("[MITM] TLS connection established to %s", targetAddr)
-	} else {
-		// 明文HTTP连接
-		log.Logf("[MITM] %s -> %s : establishing plaintext connection", clientIP, targetAddr)
-		cc, err = net.DialTimeout("tcp", targetAddr, 10*time.Second)
-		if err != nil {
-			log.Logf("[MITM] Failed to connect to %s: %v", targetAddr, err)
-			return err
-		}
+	// 如果 req.URL 是绝对 URL，则把 Scheme/Host 清掉，避免写成 absolute-form。
+	if req.URL != nil && req.URL.IsAbs() {
+		// 备份绝对URL部分（可用于日志），然后清理
+		req.URL.Scheme = ""
+		req.URL.Host = ""
 	}
 
-	defer cc.Close()
-
-	// 捕获请求Body
+	// 捕获请求体用于流量日志
 	if req.Body != nil {
 		req.Body = io.NopCloser(io.TeeReader(req.Body, &reqBuf))
 	}
 
-	// 转发请求
-	if err = req.Write(cc); err != nil {
-		log.Logf("[MITM] Failed to write request: %v", err)
+	// ---- 与目标服务器建立连接（如果是 HTTPS，则使用 tls.Dial） ----
+	var cc net.Conn
+	if true { // CONNECT -> HTTPS, 但是我们仍按端口判断是否启用 TLS
+		if port == "443" {
+			log.Logf("[MITM] %s -> %s : establishing TLS connection to target", clientIP, targetAddr)
+			tlsConfig := &tls.Config{
+				ServerName: hostname,
+				MinVersion: tls.VersionTLS12,
+			}
+			cc, err = tls.Dial("tcp", targetAddr, tlsConfig)
+			if err != nil {
+				log.Logf("[MITM] Failed to establish TLS connection to %s: %v", targetAddr, err)
+				return fmt.Errorf("tls dial failed: %w", err)
+			}
+		} else {
+			// 非 443 端口，按需使用明文（适配一些站点）
+			log.Logf("[MITM] %s -> %s : establishing plaintext connection", clientIP, targetAddr)
+			cc, err = net.DialTimeout("tcp", targetAddr, 10*time.Second)
+			if err != nil {
+				log.Logf("[MITM] Failed to connect to %s: %v", targetAddr, err)
+				return err
+			}
+		}
+	} else {
+		// （保留结构）如果以后需要按 req.URL.Scheme 决定则可修改这里
+	}
+
+	defer cc.Close()
+
+	// ---- 把请求写给目标服务器（注意：不要写成 proxy absolute-form） ----
+	if err := req.Write(cc); err != nil {
+		log.Logf("[MITM] Failed to write request to target %s: %v", targetAddr, err)
 		return err
 	}
 
-	// 读取响应
-	respReader := io.TeeReader(cc, &respBuf)
-	resp, err := http.ReadResponse(bufio.NewReader(respReader), req)
+	// ---- 读取响应 ----
+	// 用 TeeReader 捕获响应体
+	respReader := bufio.NewReader(cc)
+	resp, err := http.ReadResponse(respReader, req)
 	if err != nil {
-		log.Logf("[MITM] Failed to read response: %v", err)
+		log.Logf("[MITM] Failed to read response from target %s: %v", targetAddr, err)
 		return err
 	}
-	defer resp.Body.Close()
+	// 将响应体也 Tee 以便日志
+	if resp.Body != nil {
+		resp.Body = io.NopCloser(io.TeeReader(resp.Body, &respBuf))
+	}
 
-	// 将响应写回客户端
-	if err = resp.Write(rw); err != nil {
-		log.Logf("[MITM] Failed to write response: %v", err)
+	// ---- 写回给客户端（TLS层的 rw） ----
+	if err := resp.Write(rw); err != nil {
+		log.Logf("[MITM] Failed to write response back to client: %v", err)
+		_ = resp.Body.Close()
 		return err
 	}
 
-	// 强制读取Body以触发TeeReader
+	// 触发读取剩余 body（用于记录流量），并异步写日志
 	if EnableTrafficLog {
-		//todo record log
 		if resp.Body != nil {
 			io.Copy(io.Discard, resp.Body)
 		}
-
-		go logMITMTraffic(requestID, clientIP, originReq.Header.Get("proxy_extra_info"), req, resp, &reqBuf, &respBuf)
+		go logMITMTraffic(requestID, clientIP, originReq.Header.Get("proxy_extra_info"), "https", req, resp, &reqBuf, &respBuf)
 	}
+
+	// 关闭响应 body
+	if resp.Body != nil {
+		resp.Body.Close()
+	}
+
 	return nil
-}
-
-// 异步记录MITM流量日志
-func logMITMTraffic(requestID, clientIP, extraInfo string, req *http.Request, resp *http.Response, reqBuf, respBuf *limitedBuffer) {
-	// 读取Body内容
-	reqBody := reqBuf.Bytes()
-	respBody := respBuf.Bytes()
-
-	// 请求头
-	reqHeaders := make(map[string][]string)
-	for k, v := range req.Header {
-		reqHeaders[k] = v
-	}
-
-	// 响应头
-	respHeaders := make(map[string][]string)
-	for k, v := range resp.Header {
-		respHeaders[k] = v
-	}
-
-	t := &TrafficLog{
-		ID:             requestID,
-		Proto:          "https-mitm",
-		ClientIP:       clientIP,
-		TargetIP:       req.Host,
-		URL:            fmt.Sprintf("https://%s%s", req.Host, req.URL.Path),
-		Method:         req.Method,
-		Query:          req.URL.RawQuery,
-		ReqHeaders:     reqHeaders,
-		ReqBodyBase64:  base64.StdEncoding.EncodeToString(reqBody),
-		RespHeaders:    respHeaders,
-		RespBodyBase64: base64.StdEncoding.EncodeToString(respBody),
-		Status:         resp.StatusCode,
-		Time:           time.Now(),
-	}
-	Write(t)
-
-	// 实时打印摘要
-	log.Logf("[TRAFFIC] ID=%s,%s | %s %s | Status=%d | Req=%db Resp=%db",
-		requestID, extraInfo, req.Method, req.URL.Path, resp.StatusCode,
-		len(reqBody), len(respBody))
-}
-
-func (h *httpHandler) handleProxy(rw, cc io.ReadWriter, req *http.Request) (err error) {
-	req.Header.Del("Proxy-Connection")
-
-	if err = req.Write(cc); err != nil {
-		return err
-	}
-
-	ch := make(chan error, 1)
-
-	go func() {
-		ch <- copyBuffer(rw, cc)
-	}()
-
-	for {
-		err := func() error {
-			req, err := http.ReadRequest(bufio.NewReader(rw))
-			if err != nil {
-				return err
-			}
-
-			if Debug {
-				dump, _ := httputil.DumpRequest(req, false)
-				log.Log(string(dump))
-			}
-
-			req.Header.Del("Proxy-Connection")
-
-			if err = req.Write(cc); err != nil {
-				return err
-			}
-			return nil
-		}()
-		ch <- err
-
-		if err != nil {
-			break
-		}
-	}
-
-	return <-ch
 }
 
 func (h *httpHandler) handleProxy2(rw, cc io.ReadWriter, req *http.Request) error {
@@ -865,10 +973,51 @@ func (h *httpHandler) handleProxy2(rw, cc io.ReadWriter, req *http.Request) erro
 		if resp.Body != nil {
 			io.Copy(io.Discard, resp.Body)
 		}
-		go logMITMTraffic(requestID, clientIP, extraInfo, req, resp, reqBuf, respBuf)
+		go logMITMTraffic(requestID, clientIP, extraInfo, "http", req, resp, reqBuf, respBuf)
 	}
 
 	return nil
+}
+
+// 异步记录MITM流量日志
+func logMITMTraffic(requestID, clientIP, extraInfo, proto string, req *http.Request, resp *http.Response, reqBuf, respBuf *limitedBuffer) {
+	// 读取Body内容
+	reqBody := reqBuf.Bytes()
+	respBody := respBuf.Bytes()
+
+	// 请求头
+	reqHeaders := make(map[string][]string)
+	for k, v := range req.Header {
+		reqHeaders[k] = v
+	}
+
+	// 响应头
+	respHeaders := make(map[string][]string)
+	for k, v := range resp.Header {
+		respHeaders[k] = v
+	}
+
+	t := &TrafficLog{
+		ID:             requestID,
+		Proto:          proto,
+		ClientIP:       clientIP,
+		TargetIP:       req.Host,
+		URL:            fmt.Sprintf("%s://%s%s", proto, req.Host, req.URL.Path),
+		Method:         req.Method,
+		Query:          req.URL.RawQuery,
+		ReqHeaders:     reqHeaders,
+		ReqBodyBase64:  base64.StdEncoding.EncodeToString(reqBody),
+		RespHeaders:    respHeaders,
+		RespBodyBase64: base64.StdEncoding.EncodeToString(respBody),
+		Status:         resp.StatusCode,
+		Time:           time.Now(),
+	}
+	Write(t)
+
+	// 实时打印摘要
+	log.Logf("[TRAFFIC] ID=%s,%s | %s %s | Status=%d | Req=%db Resp=%db",
+		requestID, extraInfo, req.Method, req.URL.String(), resp.StatusCode,
+		len(reqBody), len(respBody))
 }
 
 func (h *httpHandler) authenticate(conn net.Conn, req *http.Request, resp *http.Response) (ok bool) {
