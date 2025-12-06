@@ -1,0 +1,47 @@
+services:
+  - name: loadbalancer
+    addr: :7890
+    handler:
+      type: socks5
+      auth:
+        username: "admin"
+        password: "123456"
+      metadata:
+        sniffing: false
+        udp: true  # 支持UDP转发
+        udpBufferSize: 4096  # UDP缓冲区大小
+      chain: chain-0
+    listener:
+      type: tcp
+
+chains:
+  - name: chain-0
+    hops:
+      - name: hop-0
+        # 节点组配置
+        selector:
+          strategy: round          # round(轮询) / random(随机) / fifo(顺序)
+          maxFails: 1              # 最大失败次数
+          failTimeout: 10s         # 失败超时
+          reload: 10s              # 配置文件热重载间隔
+        nodes:
+          - name: node-1
+            addr: 127.0.0.1:10888
+            connector:
+              type: http
+              auth:
+                username: admin
+                password: "123456"
+              metadata:
+                # 权重（可选，默认1）
+                weight: 5
+
+          - name: node-2
+            addr: 127.0.0.1:10999
+            connector:
+              type: http
+              auth:
+                username: admin
+                password: "123456"
+              metadata:
+                weight: 5  # 节点2权重较低

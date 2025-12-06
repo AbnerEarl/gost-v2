@@ -1,0 +1,45 @@
+services:
+  - name: mixed-proxy
+    addr: :7890  # 监听所有网卡（0.0.0.0）
+    handler:
+      #      type: mixed  # 关键：同时支持 SOCKS5 和 HTTP
+      auth:
+        username: admin
+        password: "123456"  # 账号密码验证
+      chain: chain-0
+    listener:
+      type: tcp
+
+chains:
+  - name: chain-0
+    hops:
+      - name: hop-0
+        selector:
+          strategy: round          # 轮询切换
+          maxFails: 1
+          failTimeout: 30s
+        nodes:
+          - name: node-1
+            addr: 127.0.0.1:10888
+            connector:
+              type: http
+              auth:
+                username: admin
+                password: "123456"
+
+          - name: node-2
+            addr: 127.0.0.1:10999
+            connector:
+              type: http
+              auth:
+                username: admin
+                password: "123456"
+
+
+api:
+  addr: :18080  # API监听端口
+  pathPrefix: /api  # URL路径前缀（可选）
+  accesslog: true   # 开启访问日志（可选）
+  auth:
+    username: admin  # API登录账号（建议与代理账号不同）
+    password: "admin"  # API登录密码
