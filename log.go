@@ -78,10 +78,11 @@ func (b *limitedBuffer) Bytes() []byte {
 // TrafficLog 表示一条流量日志记录。序列化为 JSON（单行）后便于 ELK/Fluentd 等系统采集。
 type TrafficLog struct {
 	// 基本信息
-	ID       string    `json:"id"`          // 唯一请求 ID（UUID）
-	Time     time.Time `json:"time"`        // 记录时间点（RFC3339）
-	Proto    string    `json:"proto"`       // 协议类型："http" / "https" / "socks5"
-	Duration int64     `json:"duration_ms"` // 请求处理耗时（毫秒），如未知可为 0
+	ID        string    `json:"id"`          // 唯一请求 ID（UUID）
+	Time      time.Time `json:"time"`        // 记录时间点（RFC3339）
+	Proto     string    `json:"proto"`       // 协议类型："http" / "https" / "socks5"
+	ExtraInfo string    `json:"extra_info"`  // 项目信息
+	Duration  int64     `json:"duration_ms"` // 请求处理耗时（毫秒），如未知可为 0
 
 	// 客户端信息
 	ClientIP   string `json:"client_ip,omitempty"`
@@ -179,7 +180,7 @@ func (t *TrafficLog) ToJSON() ([]byte, error) {
 }
 
 func Write(t *TrafficLog) {
-	log.Printf("[traffic] %s %s %s -> %s code=%d req=%q resp=%q\n",
-		t.Proto, t.ClientIP, t.URL, t.TargetIP, t.Status,
-		t.RespBodyBase64, t.RespBodyBase64)
+	log.Printf("[traffic] %s %s %s %s -> %s code=%d req=%d resp=%d\n",
+		t.Proto, t.ExtraInfo, t.ClientIP, t.URL, t.TargetIP, t.Status,
+		len(t.RespBodyBase64), len(t.RespBodyBase64))
 }

@@ -348,13 +348,13 @@ func (h *httpHandler) handleRequest(conn net.Conn, req *http.Request) {
 
 }
 
-func interceptHTTP(client net.Conn, server net.Conn, clientIP, requestID string) {
+func interceptHTTP(client net.Conn, server net.Conn, clientIP, requestID, extraInfo string) {
 	clientReader := bufio.NewReader(client)
 	serverReader := bufio.NewReader(server)
 
 	var reqBuf, respBuf limitedBuffer
-	reqBuf.limit = 65535 * 2
-	respBuf.limit = 65535 * 2
+	reqBuf.limit = MaxBodyLogBytes
+	respBuf.limit = MaxBodyLogBytes
 
 	for {
 		// ---- 读取客户端 HTTP 请求 ----
@@ -437,7 +437,7 @@ func interceptHTTP(client net.Conn, server net.Conn, clientIP, requestID string)
 				}
 
 				// Note: originReq header proxy_extra_info may be empty here; you can pass "" or adapt as needed.
-				logMITMTraffic(requestID, clientIP, req.Header.Get("proxy_extra_info"), "http", reqCopy, respCopy, &limitedBuffer{buf: *bytes.NewBuffer(reqB), limit: len(reqB)}, &limitedBuffer{buf: *bytes.NewBuffer(respB), limit: len(respB)})
+				logMITMTraffic(requestID, clientIP, extraInfo, "http", reqCopy, respCopy, &limitedBuffer{buf: *bytes.NewBuffer(reqB), limit: len(reqB)}, &limitedBuffer{buf: *bytes.NewBuffer(respB), limit: len(respB)})
 			}(req, resp, reqBuf.Bytes(), respBuf.Bytes())
 		} else {
 			// 如果没有启用日志，确保关闭 body
@@ -632,8 +632,11 @@ func (h *httpHandler) handleMITMConnect(conn net.Conn, req *http.Request, client
 				log.Logf("[http] [MITM] %s -> %s : dial target failed: %v", clientIP, host, err)
 				return err
 			}
+			for k, v := range req.Header {
+				log.Logf("test-%s,%v", k, v)
+			}
 			// 不要在这里并发 goroutine，直接调用 interceptHTTP，会阻塞直到完成（与 tunnel 行为一致）
-			interceptHTTP(bc, server, clientIP, requestID)
+			interceptHTTP(bc, server, clientIP, requestID, req.Header.Get("proxy_extra_info"))
 			// interceptHTTP 函数会在合适时关闭连接或返回（当前实现为直接 return，当读写结束会退出）
 			return nil
 		}
@@ -1000,6 +1003,7 @@ func logMITMTraffic(requestID, clientIP, extraInfo, proto string, req *http.Requ
 	t := &TrafficLog{
 		ID:             requestID,
 		Proto:          proto,
+		ExtraInfo:      extraInfo,
 		ClientIP:       clientIP,
 		TargetIP:       req.Host,
 		URL:            fmt.Sprintf("%s://%s%s", proto, req.Host, req.URL.Path),
@@ -1015,9 +1019,9 @@ func logMITMTraffic(requestID, clientIP, extraInfo, proto string, req *http.Requ
 	Write(t)
 
 	// 实时打印摘要
-	log.Logf("[TRAFFIC] ID=%s,%s | %s %s | Status=%d | Req=%db Resp=%db",
-		requestID, extraInfo, req.Method, req.URL.String(), resp.StatusCode,
-		len(reqBody), len(respBody))
+	//log.Logf("[TRAFFIC] ID=%s,%s | %s %s | Status=%d | Req=%db Resp=%db",
+	//	requestID, extraInfo, req.Method, req.URL.String(), resp.StatusCode,
+	//	len(reqBody), len(respBody))
 }
 
 func (h *httpHandler) authenticate(conn net.Conn, req *http.Request, resp *http.Response) (ok bool) {
