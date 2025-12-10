@@ -1,0 +1,63 @@
+services:
+  - name: http-proxy
+    addr: ":7891"
+    handler:
+      type: http
+      metadata:
+        authRequired: true
+      auther: auther-0
+      chain: chain-0
+    listener:
+      type: tcp
+  - name: socks-proxy
+    addr: ":7892"
+    handler:
+      type: socks5
+      metadata:
+        authRequired: true
+      auther: auther-0
+    listener:
+      type: tcp
+      chain: chain-0
+
+
+authers:
+  - name: auther-0
+    auths:
+      - username: admin123
+        password: "123456"
+
+chains:
+  - name: chain-0
+    hops:
+      - name: hop-0
+        selector:
+          strategy: round          # 轮询切换
+          maxFails: 1
+          failTimeout: 30s
+        nodes:
+          - name: node-1
+            addr: 127.0.0.1:10888
+            connector:
+              type: http
+              auth:
+                username: admin
+                password: "123456"
+
+          - name: node-2
+            addr: 127.0.0.1:10999
+            connector:
+              type: http
+              auth:
+                username: admin
+                password: "123456"
+
+
+api:
+  addr: :18080  # API监听端口
+  pathPrefix: /api  # URL路径前缀（可选）
+  accesslog: true   # 开启访问日志（可选）
+  auth:
+    username: admin  # API登录账号（建议与代理账号不同）
+    password: "admin"  # API登录密码
+    
